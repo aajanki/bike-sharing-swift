@@ -2,6 +2,11 @@ import Foundation
 import TensorFlow
 import CSVImporter
 
+struct Samples {
+    var features: Tensor<Float>
+    var labels: Tensor<Float>
+}
+
 func loadCsv(_ path: String) -> [[String: String]] {
     let importer = CSVImporter<[String: String]>(path: path)
     return importer.importRecords(structure: { (headerValues) -> Void in () },
@@ -74,17 +79,75 @@ func buildLabels(_ csvData: [[String: String]]) -> Tensor<Float> {
       })
 }
 
-func loadData(_ dataFile: String) -> (Tensor<Float>, Tensor<Float>) {
+func loadData(_ dataFile: String) -> Samples {
     let csvData = loadCsv(dataFile)
     let feat = buildFeatures(csvData)
     let labels = buildLabels(csvData)
-    return (feat, labels)
+    return Samples(features: feat, labels: labels)
 }
 
-let (X, y) = loadData("data/day.csv")
+func trainTestSplit(samples: Samples, testProportion: Double = 0.2) -> (Samples, Samples) {
+    // use the last part of the time series as test data
+    let count = samples.features.shape[0]
+    let testCount = Int(testProportion*Double(count))
+    let trainCount = count - testCount
 
-print("Number of samples: \(X.shape[0])")
-print("Number of features: \(X.shape[1])")
+    return (
+      train: Samples(features: samples.features[0..<trainCount], labels: samples.labels[0..<trainCount]),
+      test: Samples(features: samples.features[trainCount...], labels: samples.labels[trainCount...])
+    )
+}
 
-print(X.min(alongAxes: 0))
-print(X.max(alongAxes: 0))
+struct Regression: Layer {
+    typealias Input = Tensor<Float>
+    typealias Output = Tensor<Float>
+
+    static let hiddenDim = 16
+    var dense1 = Dense<Float>(inputSize: 27, outputSize: hiddenDim, activation: relu)
+    var dense2 = Dense<Float>(inputSize: hiddenDim, outputSize: 1, activation: identity)
+
+    @differentiable
+    func callAsFunction(_ input: Input) -> Output {
+        input.sequenced(through: dense1, dense2)
+    }
+}
+
+let epochCount = 2000
+let batchSize = 64
+let dataset = loadData("data/day.csv")
+let (trainData, testData) = trainTestSplit(samples: dataset)
+
+print("Number of samples: train: \(trainData.features.shape[0]), test: \(testData.features.shape[0])")
+print("Number of features: \(trainData.features.shape[1])")
+
+var model = Regression()
+let optimizer = Adam(for: model, learningRate: 5e-3)
+
+let batchCount = Int(ceil(Float(trainData.features.shape[0])/Float(batchSize)))
+for epoch in 1...epochCount {
+    Context.local.learningPhase = .training
+    var totalTrainingLoss: Float = 0
+    for i in 0..<batchCount {
+        let start = i*batchSize
+        let batchX = trainData.features[start..<(start + batchSize)]
+        let batchY = trainData.labels[start..<(start + batchSize)]
+        let (loss, 𝛁model) = model.valueWithGradient { model -> Tensor<Float> in
+            let ŷ = model(batchX)
+            return meanSquaredError(predicted: ŷ, expected: batchY)
+        }
+
+        totalTrainingLoss += loss.scalarized()
+
+        optimizer.update(&model.allDifferentiableVariables, along: 𝛁model)
+    }
+    let trainingMAE = meanAbsoluteError(predicted: model(trainData.features), expected: trainData.labels)
+
+    Context.local.learningPhase = .inference
+
+    let testPred = model(testData.features)
+    let testMAE = meanAbsoluteError(predicted: testPred, expected: testData.labels)
+
+    if epoch % 50 == 0 {
+        print("Epoch: \(epoch), train loss: \(totalTrainingLoss), training MAE: \(trainingMAE), test MAE: \(testMAE)")
+    }
+}
